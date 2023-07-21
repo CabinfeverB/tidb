@@ -8237,6 +8237,38 @@ func checkIgnorePlacementDDL(ctx sessionctx.Context) bool {
 	return false
 }
 
+func (d *ddl) AddRunawayWatch(ctx sessionctx.Context, record *rg.QuarantineRecord) (err error) {
+	logutil.BgLogger().Info("add runaway watch DDL", zap.String("resource group name", record.ResourceGroupName), zap.String("watch text", record.WatchText))
+	watchIDs, err := d.genGlobalIDs(1)
+	if err != nil {
+		return err
+	}
+	record.ID = watchIDs[0]
+
+	job := &model.Job{
+		SchemaName: "runaway_" + strconv.FormatInt(record.ID, 10),
+		Type:       model.ActionAddRunawayWatch,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{record},
+	}
+	err = d.DoDDLJob(ctx, job)
+	err = d.callHookOnChanged(job, err)
+	return err
+}
+
+func (d *ddl) RemoveRunawayWatch(ctx sessionctx.Context, record *rg.QuarantineRecord) (err error) {
+	logutil.BgLogger().Debug("remove runaway watch DDL", zap.String("resource group name", record.ResourceGroupName), zap.String("watch text", record.WatchText))
+	job := &model.Job{
+		SchemaName: "runaway_" + strconv.FormatInt(record.ID, 10),
+		Type:       model.ActionRemoveRunawayWatch,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{record},
+	}
+	err = d.DoDDLJob(ctx, job)
+	err = d.callHookOnChanged(job, err)
+	return err
+}
+
 // AddResourceGroup implements the DDL interface, creates a resource group.
 func (d *ddl) AddResourceGroup(ctx sessionctx.Context, stmt *ast.CreateResourceGroupStmt) (err error) {
 	groupName := stmt.ResourceGroupName

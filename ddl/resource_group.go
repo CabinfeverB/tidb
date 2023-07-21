@@ -20,12 +20,15 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	sess "github.com/pingcap/tidb/ddl/internal/session"
 	"github.com/pingcap/tidb/ddl/resourcegroup"
 	"github.com/pingcap/tidb/domain/infosync"
 	rg "github.com/pingcap/tidb/domain/resourcegroup"
 	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/util/dbterror"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
@@ -171,4 +174,128 @@ func onDropResourceGroup(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ 
 		err = dbterror.ErrInvalidDDLState.GenWithStackByArgs("resource_group", groupInfo.State)
 	}
 	return ver, errors.Trace(err)
+}
+
+func (w *worker) onAddRunawayWatch(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ error) {
+	logutil.BgLogger().Info("onAddRunawayWatch in worker")
+	record := &rg.QuarantineRecord{}
+	if err := job.DecodeArgs(record); err != nil {
+		job.State = model.JobStateCancelled
+		return ver, errors.Trace(err)
+	}
+	// we don't need to include state in QuarantineRecord
+	err := t.AddRunawayWatch(record)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+
+	ctx, err := w.sessPool.Get()
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	defer w.sessPool.Put(ctx)
+	logutil.BgLogger().Info("onAddRunawayWatch insertQuarantineRecord in worker")
+	err = insertQuarantineRecord(ctx, record)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	job.SchemaID = record.ID
+	logutil.BgLogger().Info("onAddRunawayWatch updateSchemaVersion in worker")
+	ver, err = updateSchemaVersion(d, t, job)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	// Finish this job.
+	logutil.BgLogger().Info("onAddRunawayWatch FinishDBJob in worker")
+	job.FinishDBJob(model.JobStateDone, model.StatePublic, ver, nil)
+	logutil.BgLogger().Info("onAddRunawayWatch end in worker")
+	return ver, nil
+}
+
+func (w *worker) onRemoveRunawayWatch(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ error) {
+	record := &rg.QuarantineRecord{}
+	if err := job.DecodeArgs(record); err != nil {
+		job.State = model.JobStateCancelled
+		return ver, errors.Trace(err)
+	}
+	// we don't need to include state in QuarantineRecord
+	err := t.DropRunawayWatch(record)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	ctx, err := w.sessPool.Get()
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	defer w.sessPool.Put(ctx)
+	err = deleteQuarantineRecord(ctx, record)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	job.SchemaID = record.ID
+	ver, err = updateSchemaVersion(d, t, job)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	// Finish this job.
+	job.FinishDBJob(model.JobStateDone, model.StatePublic, ver, nil)
+	return ver, nil
+}
+
+func insertQuarantineRecord(se sessionctx.Context, record *rg.QuarantineRecord) error {
+	ns := sess.NewSession(se)
+	err := ns.Begin()
+	if err != nil {
+		return err
+	}
+	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnStats)
+	sql, params := record.GenSelectionStmt()
+	r, err := ns.ExecuteWithParams(ctx, sql, "check_runaway_watch", params...)
+	logutil.BgLogger().Info("GenSelectionStmt", zap.String("sql", sql), zap.Any("params", params), zap.Error(err))
+	if err != nil {
+		ns.Rollback()
+		return err
+	}
+	if len(r) > 0 {
+		sql, params := record.GenUpdationStmt()
+		_, err := ns.ExecuteWithParams(ctx, sql, "update_runaway_watch", params...)
+		if err != nil {
+			ns.Rollback()
+			return err
+		}
+	} else {
+		sql, params := record.GenInsertionStmt()
+		_, err := ns.ExecuteWithParams(ctx, sql, "insert_runaway_watch", params...)
+		if err != nil {
+			ns.Rollback()
+			return err
+		}
+	}
+	err = ns.Commit()
+	if err != nil {
+		ns.Rollback()
+		return err
+	}
+	return nil
+}
+
+func deleteQuarantineRecord(se sessionctx.Context, record *rg.QuarantineRecord) error {
+	ns := sess.NewSession(se)
+	err := ns.Begin()
+	if err != nil {
+		return err
+	}
+	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnStats)
+	sql, params := record.GenDeletionStmt()
+	_, err = ns.ExecuteWithParams(ctx, sql, "delete_runaway_watch", params...)
+	if err != nil {
+		ns.Rollback()
+		return err
+	}
+	err = ns.Commit()
+	if err != nil {
+		ns.Rollback()
+		return err
+	}
+	return nil
 }

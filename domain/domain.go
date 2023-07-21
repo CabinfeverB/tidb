@@ -275,7 +275,7 @@ func (do *Domain) loadInfoSchema(startTS uint64) (infoschema.InfoSchema, bool, i
 		return nil, false, currentSchemaVersion, nil, err
 	}
 
-	newISBuilder, err := infoschema.NewBuilder(do.Store(), do.sysFacHack).InitWithDBInfos(schemas, policies, resourceGroups, neededSchemaVersion)
+	newISBuilder, err := infoschema.NewBuilder(do.Store(), do.runawayManager, do.sysFacHack).InitWithDBInfos(schemas, policies, resourceGroups, neededSchemaVersion)
 	if err != nil {
 		return nil, false, currentSchemaVersion, nil, err
 	}
@@ -423,7 +423,7 @@ func (do *Domain) tryLoadSchemaDiffs(m *meta.Meta, usedVersion, newVersion int64
 		}
 		diffs = append(diffs, diff)
 	}
-	builder := infoschema.NewBuilder(do.Store(), do.sysFacHack).InitWithOldInfoSchema(do.infoCache.GetLatest())
+	builder := infoschema.NewBuilder(do.Store(), do.runawayManager, do.sysFacHack).InitWithOldInfoSchema(do.infoCache.GetLatest())
 	builder.SetDeltaUpdateBundles()
 	phyTblIDs := make([]int64, 0, len(diffs))
 	actions := make([]uint64, 0, len(diffs))
@@ -1361,43 +1361,31 @@ func (do *Domain) runawayRecordFlushLoop() {
 	// we can guarantee a watch record can be seen by the user within 1s.
 	runawayRecordFluashTimer := time.NewTimer(runawayRecordFluashInterval)
 	runawayRecordGCTicker := time.NewTicker(runawayRecordGCInterval)
-	quarantineRecordGCTicker := time.NewTicker(quarantineRecordGCInterval)
 	failpoint.Inject("FastRunawayGC", func() {
 		runawayRecordFluashTimer.Stop()
 		runawayRecordGCTicker.Stop()
-		quarantineRecordGCTicker.Stop()
 		runawayRecordFluashTimer = time.NewTimer(time.Millisecond * 50)
 		runawayRecordGCTicker = time.NewTicker(time.Millisecond * 200)
-		quarantineRecordGCTicker = time.NewTicker(time.Millisecond * 200)
 	})
 
 	fired := false
 	recordCh := do.RunawayManager().RunawayRecordChan()
 	quarantineRecordCh := do.RunawayManager().QuarantineRecordChan()
+	removedQuarantineRecordCh := do.RunawayManager().RemovedQuarantineRecordChan()
 	flushThrehold := do.runawayManager.FlushThreshold()
 	records := make([]*resourcegroup.RunawayRecord, 0, flushThrehold)
-	quarantineRecords := make([]*resourcegroup.QuarantineRecord, 0)
 
 	flushRunawayRecords := func() {
 		if len(records) == 0 {
 			return
 		}
-		sql, params := genRunawayQueriesStmt(records)
+		sql, params := resourcegroup.GenRunawayQueriesStmt(records)
 		if _, err := do.execRestrictedSQL(sql, params); err != nil {
 			logutil.BgLogger().Error("flush runaway records failed", zap.Error(err), zap.Int("count", len(records)))
 		}
 		records = records[:0]
 	}
-	flushQuarantineRecords := func() {
-		if len(quarantineRecords) == 0 {
-			return
-		}
-		sql, params := genQuarantineQueriesStmt(quarantineRecords)
-		if _, err := do.execRestrictedSQL(sql, params); err != nil {
-			logutil.BgLogger().Error("flush quarantine records failed", zap.Error(err), zap.Int("count", len(quarantineRecords)))
-		}
-		quarantineRecords = quarantineRecords[:0]
-	}
+
 	for {
 		select {
 		case <-do.exit:
@@ -1405,13 +1393,6 @@ func (do *Domain) runawayRecordFlushLoop() {
 		case <-runawayRecordFluashTimer.C:
 			flushRunawayRecords()
 			fired = true
-		case r := <-quarantineRecordCh:
-			quarantineRecords = append(quarantineRecords, r)
-			// we expect quarantine record should not be triggered very often, so always
-			// flush as soon as possible.
-			if len(quarantineRecordCh) == 0 || len(quarantineRecords) >= flushThrehold {
-				flushQuarantineRecords()
-			}
 		case r := <-recordCh:
 			records = append(records, r)
 			failpoint.Inject("FastRunawayGC", func() {
@@ -1426,10 +1407,42 @@ func (do *Domain) runawayRecordFlushLoop() {
 			}
 		case <-runawayRecordGCTicker.C:
 			go do.deleteExpiredRows("tidb_runaway_queries", "time", runawayRecordExpiredDuration)
-		case <-quarantineRecordGCTicker.C:
-			go do.deleteExpiredRows("tidb_runaway_quarantined_watch", "end_time", time.Duration(0))
+		case r := <-quarantineRecordCh:
+			do.handleRunawayWatch(r)
+		case r := <-removedQuarantineRecordCh:
+			do.handleRemoveRunawayWatch(r)
 		}
 	}
+}
+
+func (do *Domain) handleRunawayWatch(record *resourcegroup.QuarantineRecord) error {
+	se, err := do.sysSessionPool.Get()
+	defer func() {
+		do.sysSessionPool.Put(se)
+	}()
+	if err != nil {
+		return errors.Annotate(err, "get session failed")
+	}
+	logutil.BgLogger().Info("handleRunawayWatch in domain")
+	defer func() {
+		logutil.BgLogger().Info("handleRunawayWatch end in domain")
+	}()
+	return do.DDL().AddRunawayWatch(se.(sessionctx.Context), record)
+}
+
+func (do *Domain) handleRemoveRunawayWatch(record *resourcegroup.QuarantineRecord) error {
+	// we only need to do remove runaway watch job in ddl owner.
+	if !do.DDL().OwnerManager().IsOwner() {
+		return nil
+	}
+	se, err := do.sysSessionPool.Get()
+	defer func() {
+		do.sysSessionPool.Put(se)
+	}()
+	if err != nil {
+		return errors.Annotate(err, "get session failed")
+	}
+	return do.DDL().RemoveRunawayWatch(se.(sessionctx.Context), record)
 }
 
 func (do *Domain) execRestrictedSQL(sql string, params []interface{}) ([]chunk.Row, error) {
@@ -1448,43 +1461,28 @@ func (do *Domain) execRestrictedSQL(sql string, params []interface{}) ([]chunk.R
 	return r, err
 }
 
-func genRunawayQueriesStmt(records []*resourcegroup.RunawayRecord) (string, []interface{}) {
-	var builder strings.Builder
-	params := make([]interface{}, 0, len(records)*7)
-	builder.WriteString("insert into mysql.tidb_runaway_queries VALUES ")
-	for count, r := range records {
-		if count > 0 {
-			builder.WriteByte(',')
-		}
-		builder.WriteString("(%?, %?, %?, %?, %?, %?, %?)")
-		params = append(params, r.ResourceGroupName)
-		params = append(params, r.Time)
-		params = append(params, r.Match)
-		params = append(params, r.Action)
-		params = append(params, r.SQLText)
-		params = append(params, r.PlanDigest)
-		params = append(params, r.From)
+func (do *Domain) execRestrictedSQLWithTxn(sql string, params []interface{}) ([]chunk.Row, error) {
+	se, err := do.sysSessionPool.Get()
+	defer func() {
+		do.sysSessionPool.Put(se)
+	}()
+	if err != nil {
+		return nil, errors.Annotate(err, "get session failed")
 	}
-	return builder.String(), params
-}
-
-func genQuarantineQueriesStmt(records []*resourcegroup.QuarantineRecord) (string, []interface{}) {
-	var builder strings.Builder
-	params := make([]interface{}, 0, len(records)*7)
-	builder.WriteString("insert into mysql.tidb_runaway_quarantined_watch VALUES ")
-	for count, r := range records {
-		if count > 0 {
-			builder.WriteByte(',')
-		}
-		builder.WriteString("(%?, %?, %?, %?, %?, %?)")
-		params = append(params, r.ResourceGroupName)
-		params = append(params, r.StartTime)
-		params = append(params, r.EndTime)
-		params = append(params, r.Watch)
-		params = append(params, r.WatchText)
-		params = append(params, r.From)
+	exec := se.(sqlexec.RestrictedSQLExecutor)
+	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnStats)
+	_, _, err = exec.ExecRestrictedSQL(ctx, []sqlexec.OptionFuncAlias{sqlexec.ExecOptionUseCurSession}, "BEGIN")
+	if err != nil {
+		return nil, err
 	}
-	return builder.String(), params
+	r, _, err := exec.ExecRestrictedSQL(ctx, []sqlexec.OptionFuncAlias{sqlexec.ExecOptionUseCurSession},
+		sql, params...,
+	)
+	_, _, err = exec.ExecRestrictedSQL(ctx, []sqlexec.OptionFuncAlias{sqlexec.ExecOptionUseCurSession}, "COMMIT")
+	if err != nil {
+		return nil, err
+	}
+	return r, err
 }
 
 func (do *Domain) initResourceGroupsController(ctx context.Context, pdClient pd.Client) error {

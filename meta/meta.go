@@ -34,6 +34,8 @@ import (
 	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/structure"
 	"github.com/pingcap/tidb/util/dbterror"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 var (
@@ -57,27 +59,29 @@ var (
 //
 
 var (
-	mMetaPrefix          = []byte("m")
-	mNextGlobalIDKey     = []byte("NextGlobalID")
-	mSchemaVersionKey    = []byte("SchemaVersionKey")
-	mDBs                 = []byte("DBs")
-	mDBPrefix            = "DB"
-	mTablePrefix         = "Table"
-	mSequencePrefix      = "SID"
-	mSeqCyclePrefix      = "SequenceCycle"
-	mTableIDPrefix       = "TID"
-	mIncIDPrefix         = "IID"
-	mRandomIDPrefix      = "TARID"
-	mBootstrapKey        = []byte("BootstrapKey")
-	mSchemaDiffPrefix    = "Diff"
-	mPolicies            = []byte("Policies")
-	mPolicyPrefix        = "Policy"
-	mResourceGroups      = []byte("ResourceGroups")
-	mResourceGroupPrefix = "RG"
-	mPolicyGlobalID      = []byte("PolicyGlobalID")
-	mPolicyMagicByte     = CurrentMagicByteVer
-	mDDLTableVersion     = []byte("DDLTableVersion")
-	mMetaDataLock        = []byte("metadataLock")
+	mMetaPrefix           = []byte("m")
+	mNextGlobalIDKey      = []byte("NextGlobalID")
+	mSchemaVersionKey     = []byte("SchemaVersionKey")
+	mDBs                  = []byte("DBs")
+	mDBPrefix             = "DB"
+	mTablePrefix          = "Table"
+	mSequencePrefix       = "SID"
+	mSeqCyclePrefix       = "SequenceCycle"
+	mTableIDPrefix        = "TID"
+	mIncIDPrefix          = "IID"
+	mRandomIDPrefix       = "TARID"
+	mBootstrapKey         = []byte("BootstrapKey")
+	mSchemaDiffPrefix     = "Diff"
+	mPolicies             = []byte("Policies")
+	mPolicyPrefix         = "Policy"
+	mResourceGroups       = []byte("ResourceGroups")
+	mResourceGroupPrefix  = "RG"
+	mRunawayWatchPrefix   = "RW"
+	mRunawayWatchIDPrefix = "RWID"
+	mPolicyGlobalID       = []byte("PolicyGlobalID")
+	mPolicyMagicByte      = CurrentMagicByteVer
+	mDDLTableVersion      = []byte("DDLTableVersion")
+	mMetaDataLock         = []byte("metadataLock")
 	// the id for 'default' group, the internal ddl can ensure
 	// user created resource group won't duplicate with this id.
 	defaultGroupID = int64(1)
@@ -259,6 +263,14 @@ func (*Meta) policyKey(policyID int64) []byte {
 
 func (*Meta) resourceGroupKey(groupID int64) []byte {
 	return []byte(fmt.Sprintf("%s:%d", mResourceGroupPrefix, groupID))
+}
+
+func (*Meta) runawayWatchKey(recordKey string) []byte {
+	return []byte(mRunawayWatchPrefix + ":" + recordKey)
+}
+
+func (*Meta) runawayWatchIDKey(recordID int64) []byte {
+	return []byte(fmt.Sprintf("%s:%d", mRunawayWatchIDPrefix, recordID))
 }
 
 func (*Meta) dbKey(dbID int64) []byte {
@@ -487,6 +499,14 @@ func (m *Meta) checkResourceGroupNotExists(groupKey []byte) error {
 	return errors.Trace(err)
 }
 
+func (m *Meta) checkRunawayWatchNotExists(recordKey []byte) error {
+	v, err := m.txn.HGet(mResourceGroups, recordKey)
+	if err == nil && v != nil {
+		err = ErrResourceGroupExists.GenWithStack("runaway watch record already exists")
+	}
+	return errors.Trace(err)
+}
+
 func (m *Meta) checkResourceGroupExists(groupKey []byte) error {
 	v, err := m.txn.HGet(mResourceGroups, groupKey)
 	if err == nil && v == nil {
@@ -575,6 +595,56 @@ func (m *Meta) AddResourceGroup(group *model.ResourceGroupInfo) error {
 		return errors.Trace(err)
 	}
 	return m.txn.HSet(mResourceGroups, groupKey, attachMagicByte(data))
+}
+
+func (m *Meta) AddRunawayWatch(record *resourcegroup.QuarantineRecord) error {
+	if record.ID == 0 {
+		return errors.New("record.ID is invalid")
+	}
+	recordKey := m.runawayWatchKey(record.GetRecordKey())
+	if err := m.checkRunawayWatchNotExists(recordKey); err != nil {
+		return errors.Trace(err)
+	}
+
+	data, err := json.Marshal(record)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	recordIDKey := m.runawayWatchIDKey(record.ID)
+	magicRecordKey := make([]byte, len(recordKey))
+	copy(magicRecordKey, recordKey)
+	magicRecordKey = attachMagicByte(magicRecordKey)
+	logutil.BgLogger().Info("recordKey", zap.ByteString("recordKey", recordKey), zap.ByteString("recordIDKey", recordIDKey), zap.ByteString("recordIDKey2", magicRecordKey))
+	err = m.txn.HSet(mResourceGroups, recordIDKey, magicRecordKey)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	//return m.txn.HSet(mResourceGroups, recordKey, attachMagicByte(data))
+	err = m.txn.HSet(mResourceGroups, recordKey, attachMagicByte(data))
+	if err != nil {
+		return errors.Trace(err)
+	}
+	keyValue, err := m.txn.HGet(mResourceGroups, recordIDKey)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	logutil.BgLogger().Info("keyValue 1", zap.ByteString("keyValue", keyValue))
+	keyValue, _ = detachMagicByte(keyValue)
+	keyValue2, err := m.txn.HGet(mResourceGroups, keyValue)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	logutil.BgLogger().Info("keyValue 2", zap.ByteString("keyValue", keyValue), zap.ByteString("keyValue2", keyValue2))
+	return nil
+}
+
+// DropRunawayWatch drops a runaway watch item.
+func (m *Meta) DropRunawayWatch(record *resourcegroup.QuarantineRecord) error {
+	recordKey := m.runawayWatchKey(record.GetRecordKey())
+	if err := m.txn.HDel(mResourceGroups, recordKey); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
 }
 
 // UpdateResourceGroup updates a resource group.
@@ -1038,6 +1108,39 @@ func (m *Meta) ListResourceGroups() ([]*model.ResourceGroupInfo, error) {
 // DefaultGroupMeta4Test return the default group info for test usage.
 func DefaultGroupMeta4Test() *model.ResourceGroupInfo {
 	return defaultRGroupMeta
+}
+
+func (m *Meta) GetRunawayWatchRecord(recordID int64) (*resourcegroup.QuarantineRecord, error) {
+	recordIDKey := m.runawayWatchIDKey(recordID)
+	keyValue, err := m.txn.HGet(mResourceGroups, recordIDKey)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if keyValue == nil {
+		return nil, errors.Errorf("runaway watch id : %d doesn't exist", recordID)
+	}
+	logutil.BgLogger().Info("GetRunawayWatchRecord", zap.Int64("recordID", recordID),
+		zap.ByteString("recordKey", keyValue), zap.ByteString("recordIDKey", recordIDKey))
+	keyValue, err = detachMagicByte(keyValue)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	value, err := m.txn.HGet(mResourceGroups, keyValue)
+	logutil.BgLogger().Info("GetRunawayWatchRecord2",
+		zap.ByteString("recordKey", keyValue))
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if value == nil {
+		return nil, errors.Errorf("runaway watch key : %s doesn't exist", string(value))
+	}
+	value, err = detachMagicByte(value)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	record := &resourcegroup.QuarantineRecord{}
+	err = json.Unmarshal(value, record)
+	return record, errors.Trace(err)
 }
 
 // GetResourceGroup gets the database value with ID.

@@ -102,6 +102,8 @@ const (
 	ActionCreateResourceGroup           ActionType = 68
 	ActionAlterResourceGroup            ActionType = 69
 	ActionDropResourceGroup             ActionType = 70
+	ActionAddRunawayWatch               ActionType = 71
+	ActionRemoveRunawayWatch            ActionType = 72
 )
 
 var actionMap = map[ActionType]string{
@@ -170,6 +172,8 @@ var actionMap = map[ActionType]string{
 	ActionCreateResourceGroup:           "create resource group",
 	ActionAlterResourceGroup:            "alter resource group",
 	ActionDropResourceGroup:             "drop resource group",
+	ActionAddRunawayWatch:               "add runaway watch item",
+	ActionRemoveRunawayWatch:            "remove runaway watch item",
 
 	// `ActionAlterTableAlterPartition` is removed and will never be used.
 	// Just left a tombstone here for compatibility.

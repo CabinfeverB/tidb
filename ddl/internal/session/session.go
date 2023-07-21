@@ -98,6 +98,33 @@ func (s *Session) Execute(ctx context.Context, query string, label string) ([]ch
 	return rows, nil
 }
 
+// Execute executes a query.
+func (s *Session) ExecuteWithParams(ctx context.Context, query string, label string, params ...interface{}) ([]chunk.Row, error) {
+	startTime := time.Now()
+	var err error
+	defer func() {
+		metrics.DDLJobTableDuration.WithLabelValues(label + "-" + metrics.RetLabel(err)).Observe(time.Since(startTime).Seconds())
+	}()
+
+	if ctx.Value(kv.RequestSourceKey) == nil {
+		ctx = kv.WithInternalSourceType(ctx, kv.InternalTxnDDL)
+	}
+	rs, err := s.Context.(sqlexec.SQLExecutor).ExecuteInternal(ctx, query, params...)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	if rs == nil {
+		return nil, nil
+	}
+	var rows []chunk.Row
+	defer terror.Call(rs.Close)
+	if rows, err = sqlexec.DrainRecordSet(ctx, rs, 8); err != nil {
+		return nil, errors.Trace(err)
+	}
+	return rows, nil
+}
+
 // Session returns the sessionctx.Context.
 func (s *Session) Session() sessionctx.Context {
 	return s.Context

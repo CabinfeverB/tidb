@@ -1116,6 +1116,10 @@ func (w *worker) runDDLJob(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, 
 		ver, err = onAlterResourceGroup(d, t, job)
 	case model.ActionDropResourceGroup:
 		ver, err = onDropResourceGroup(d, t, job)
+	case model.ActionAddRunawayWatch:
+		ver, err = w.onAddRunawayWatch(d, t, job)
+	case model.ActionRemoveRunawayWatch:
+		ver, err = w.onRemoveRunawayWatch(d, t, job)
 	case model.ActionAlterCacheTable:
 		ver, err = onAlterCacheTable(d, t, job)
 	case model.ActionAlterNoCacheTable:

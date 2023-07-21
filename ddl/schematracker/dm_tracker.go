@@ -27,6 +27,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/ddl/syncer"
+	rg "github.com/pingcap/tidb/domain/resourcegroup"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/owner"
@@ -1180,6 +1181,16 @@ func (SchemaTracker) DropResourceGroup(_ sessionctx.Context, _ *ast.DropResource
 
 // AlterResourceGroup implements the DDL interface, it's no-op in DM's case.
 func (SchemaTracker) AlterResourceGroup(_ sessionctx.Context, _ *ast.AlterResourceGroupStmt) error {
+	return nil
+}
+
+// AddRunawayWatch implements the DDL interface.
+func (SchemaTracker) AddRunawayWatch(ctx sessionctx.Context, record *rg.QuarantineRecord) error {
+	return nil
+}
+
+// RemoveRunawayWatch implements the DDL interface.
+func (SchemaTracker) RemoveRunawayWatch(ctx sessionctx.Context, record *rg.QuarantineRecord) error {
 	return nil
 }
 

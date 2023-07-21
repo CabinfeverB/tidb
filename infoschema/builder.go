@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl/placement"
+	"github.com/pingcap/tidb/domain/resourcegroup"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
@@ -185,6 +186,8 @@ type Builder struct {
 	// TODO: store is only used by autoid allocators
 	// detach allocators from storage, use passed transaction in the feature
 	store kv.Storage
+	//
+	runawayManager *resourcegroup.RunawayManager
 
 	factory func() (pools.Resource, error)
 	bundleInfoBuilder
@@ -217,6 +220,10 @@ func (b *Builder) ApplyDiff(m *meta.Meta, diff *model.SchemaDiff) ([]int64, erro
 		return nil, b.applyCreateOrAlterResourceGroup(m, diff)
 	case model.ActionDropResourceGroup:
 		return b.applyDropResourceGroup(m, diff), nil
+	case model.ActionAddRunawayWatch:
+		return nil, b.applyAddRunawayWatch(m, diff)
+	case model.ActionRemoveRunawayWatch:
+		return b.applyDropRunawayWatch(m, diff), nil
 	case model.ActionTruncateTablePartition, model.ActionTruncateTable:
 		return b.applyTruncateTableOrPartition(m, diff)
 	case model.ActionDropTable, model.ActionDropTablePartition:
@@ -549,6 +556,24 @@ func (b *Builder) applyDropResourceGroup(m *meta.Meta, diff *model.SchemaDiff) [
 	}
 	b.is.deleteResourceGroup(group.Name.L)
 	// TODO: return the related information.
+	return []int64{}
+}
+
+func (b *Builder) applyAddRunawayWatch(m *meta.Meta, diff *model.SchemaDiff) error {
+	logutil.BgLogger().Info("applyAddRunawayWatch in Builder")
+	record, err := m.GetRunawayWatchRecord(diff.SchemaID)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if record == nil {
+		return errors.Errorf("runaway watch id : %d doesn't exist", diff.SchemaID)
+	}
+	b.runawayManager.AddWatch(record)
+	return nil
+}
+
+func (b *Builder) applyDropRunawayWatch(m *meta.Meta, diff *model.SchemaDiff) []int64 {
+	b.runawayManager.RemoveWatch(diff.SchemaID)
 	return []int64{}
 }
 
@@ -1068,9 +1093,10 @@ func RegisterVirtualTable(dbInfo *model.DBInfo, tableFromMeta tableFromMetaFunc)
 }
 
 // NewBuilder creates a new Builder with a Handle.
-func NewBuilder(store kv.Storage, factory func() (pools.Resource, error)) *Builder {
+func NewBuilder(store kv.Storage, runawayManager *resourcegroup.RunawayManager, factory func() (pools.Resource, error)) *Builder {
 	return &Builder{
-		store: store,
+		store:          store,
+		runawayManager: runawayManager,
 		is: &infoSchema{
 			schemaMap:             map[string]*schemaTables{},
 			policyMap:             map[string]*model.PolicyInfo{},

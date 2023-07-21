@@ -15,6 +15,7 @@
 package resourcegroup
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,8 +72,30 @@ type RunawayRecord struct {
 	From              string
 }
 
+// GenRunawayQueriesStmt generates statement with given RunawayRecords.
+func GenRunawayQueriesStmt(records []*RunawayRecord) (string, []interface{}) {
+	var builder strings.Builder
+	params := make([]interface{}, 0, len(records)*7)
+	builder.WriteString("insert into mysql.tidb_runaway_queries VALUES ")
+	for count, r := range records {
+		if count > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString("(%?, %?, %?, %?, %?, %?, %?)")
+		params = append(params, r.ResourceGroupName)
+		params = append(params, r.Time)
+		params = append(params, r.Match)
+		params = append(params, r.Action)
+		params = append(params, r.SQLText)
+		params = append(params, r.PlanDigest)
+		params = append(params, r.From)
+	}
+	return builder.String(), params
+}
+
 // QuarantineRecord is used to save records which will be insert into mysql.tidb_runaway_quarantined_watch.
 type QuarantineRecord struct {
+	ID                int64
 	ResourceGroupName string
 	StartTime         time.Time
 	EndTime           time.Time
@@ -81,26 +104,98 @@ type QuarantineRecord struct {
 	From              string
 }
 
+func (r *QuarantineRecord) GetRecordKey() string {
+	return r.ResourceGroupName + "/" + r.WatchText
+}
+
+func (r *QuarantineRecord) GenInsertionStmt() (string, []interface{}) {
+	var builder strings.Builder
+	params := make([]interface{}, 0, 6)
+	builder.WriteString("insert into mysql.tidb_runaway_quarantined_watch VALUES ")
+	builder.WriteString("(%?, %?, %?, %?, %?, %?)")
+	params = append(params, r.ResourceGroupName)
+	params = append(params, r.StartTime)
+	params = append(params, r.EndTime)
+	params = append(params, r.Watch)
+	params = append(params, r.WatchText)
+	params = append(params, r.From)
+	return builder.String(), params
+}
+
+func (r *QuarantineRecord) GenSelectionStmt() (string, []interface{}) {
+	var builder strings.Builder
+	params := make([]interface{}, 0, 2)
+	builder.WriteString("select * from mysql.tidb_runaway_quarantined_watch ")
+	builder.WriteString("where resource_group_name = %? and watch_text = %?")
+	params = append(params, r.ResourceGroupName)
+	params = append(params, r.WatchText)
+	return builder.String(), params
+}
+
+func (r *QuarantineRecord) GenUpdationStmt() (string, []interface{}) {
+	var builder strings.Builder
+	params := make([]interface{}, 0, 6)
+	builder.WriteString("update mysql.tidb_runaway_quarantined_watch set ")
+	builder.WriteString("resource_group_name = %?, ")
+	builder.WriteString("start_time = %?, ")
+	builder.WriteString("end_time = %?, ")
+	builder.WriteString("watch = %?, ")
+	builder.WriteString("watch_text = %?, ")
+	builder.WriteString("tidb_server = %?, ")
+	builder.WriteString("where resource_group_name = %? and watch_text = %?")
+	params = append(params, r.ResourceGroupName)
+	params = append(params, r.StartTime)
+	params = append(params, r.EndTime)
+	params = append(params, r.Watch)
+	params = append(params, r.WatchText)
+	params = append(params, r.From)
+	params = append(params, r.ResourceGroupName)
+	params = append(params, r.WatchText)
+	return builder.String(), params
+}
+
+func (r *QuarantineRecord) GenDeletionStmt() (string, []interface{}) {
+	var builder strings.Builder
+	params := make([]interface{}, 0, 6)
+	builder.WriteString("delete mysql.tidb_runaway_quarantined_watch ")
+	builder.WriteString("where resource_group_name = %? and watch_text = %?")
+	params = append(params, r.ResourceGroupName)
+	params = append(params, r.WatchText)
+	return builder.String(), params
+}
+
 // RunawayManager is used to detect and record runaway queries.
 type RunawayManager struct {
-	queryLock          sync.Mutex
-	resourceGroupCtl   *rmclient.ResourceGroupsController
-	watchList          *ttlcache.Cache[string, struct{}]
-	serverID           string
-	runawayQueriesChan chan *RunawayRecord
-	quarantineChan     chan *QuarantineRecord
+	queryLock        sync.Mutex
+	resourceGroupCtl *rmclient.ResourceGroupsController
+	watchList        *ttlcache.Cache[string, *QuarantineRecord]
+	// watchMap is used for remove item. record_id => record
+	watchMap             map[int64]*QuarantineRecord
+	serverID             string
+	runawayQueriesChan   chan *RunawayRecord
+	quarantineChan       chan *QuarantineRecord
+	removeQuarantineChan chan *QuarantineRecord
+	evictionCancel       func()
 }
 
 // NewRunawayManager creates a new RunawayManager.
 func NewRunawayManager(resourceGroupCtl *rmclient.ResourceGroupsController, serverAddr string) *RunawayManager {
-	watchList := ttlcache.New[string, struct{}](ttlcache.WithCapacity[string, struct{}](maxWatchListCap))
+	watchList := ttlcache.New[string, *QuarantineRecord](ttlcache.WithCapacity[string, *QuarantineRecord](maxWatchListCap))
 	go watchList.Start()
+	removeQuarantineChan := make(chan *QuarantineRecord, maxWatchRecordChannelSize)
+	watchMap := make(map[int64]*QuarantineRecord)
+	evictionCancel := watchList.OnEviction(func(ctx context.Context, er ttlcache.EvictionReason, i *ttlcache.Item[string, *QuarantineRecord]) {
+		removeQuarantineChan <- i.Value()
+		delete(watchMap, i.Value().ID)
+	})
 	return &RunawayManager{
 		resourceGroupCtl:   resourceGroupCtl,
 		watchList:          watchList,
 		serverID:           serverAddr,
 		runawayQueriesChan: make(chan *RunawayRecord, maxWatchRecordChannelSize),
 		quarantineChan:     make(chan *QuarantineRecord, maxWatchRecordChannelSize),
+		evictionCancel:     evictionCancel,
+		watchMap:           watchMap,
 	}
 }
 
@@ -117,28 +212,46 @@ func (rm *RunawayManager) DeriveChecker(resourceGroupName string, originalSQL st
 	return newRunawayChecker(rm, resourceGroupName, group.RunawaySettings, originalSQL, planDigest)
 }
 
-func (rm *RunawayManager) markQuarantine(resourceGroupName, convict, watchType string, ttl time.Duration, action string, now *time.Time) {
-	key := resourceGroupName + "/" + convict
-	if rm.watchList.Get(key) == nil {
-		rm.queryLock.Lock()
-		if rm.watchList.Get(key) == nil {
-			rm.watchList.Set(key, struct{}{}, ttl)
-		}
-		rm.queryLock.Unlock()
-	}
-	select {
-	case rm.quarantineChan <- &QuarantineRecord{
+func (rm *RunawayManager) markQuarantine(resourceGroupName, convict, watchType string, ttl time.Duration, now *time.Time) {
+	logutil.BgLogger().Info("markQuarantine in runaway manager")
+	record := &QuarantineRecord{
 		ResourceGroupName: resourceGroupName,
 		StartTime:         *now,
 		EndTime:           now.Add(ttl),
 		Watch:             watchType,
 		WatchText:         convict,
 		From:              rm.serverID,
-	}:
+	}
+	// rm.addWatchList(record, ttl)
+	select {
+	case rm.quarantineChan <- record:
 	default:
 		// TODO: add warning for discard flush records
 	}
 }
+
+func (rm *RunawayManager) addWatchList(record *QuarantineRecord, ttl time.Duration) {
+	key := record.ResourceGroupName + "/" + record.WatchText
+	if rm.watchList.Get(key) == nil {
+		rm.queryLock.Lock()
+		if rm.watchList.Get(key) == nil {
+			rm.watchList.Set(key, record, ttl)
+		}
+		rm.queryLock.Unlock()
+	}
+}
+
+func (rm *RunawayManager) AddWatch(record *QuarantineRecord) {
+	ttl := time.Until(record.EndTime)
+	rm.addWatchList(record, ttl)
+	rm.watchMap[record.ID] = record
+}
+
+func (rm *RunawayManager) RemoveWatch(recordID int64) {
+	// ttl := time.Until(endTime)
+	// rm.addWatchList(resourceGroupName, convict, ttl)
+}
+
 func (rm *RunawayManager) markRunaway(resourceGroupName, originalSQL, planDigest string, action string, matchType RunawayMatchType, now *time.Time) {
 	select {
 	case rm.runawayQueriesChan <- &RunawayRecord{
@@ -168,6 +281,11 @@ func (rm *RunawayManager) RunawayRecordChan() <-chan *RunawayRecord {
 // QuarantineRecordChan returns the channel of QuarantineRecord
 func (rm *RunawayManager) QuarantineRecordChan() <-chan *QuarantineRecord {
 	return rm.quarantineChan
+}
+
+// RemovedQuarantineRecordChan returns the channel of RemovedQuarantineRecord
+func (rm *RunawayManager) RemovedQuarantineRecordChan() <-chan *QuarantineRecord {
+	return rm.removeQuarantineChan
 }
 
 // examineWatchList check whether the query is in watch list.
@@ -236,6 +354,9 @@ func (r *RunawayChecker) BeforeExecutor() error {
 
 // BeforeCopRequest checks runaway and modifies the request if necessary before sending coprocessor request.
 func (r *RunawayChecker) BeforeCopRequest(req *tikvrpc.Request) error {
+	if err := r.BeforeExecutor(); err != nil {
+		return err
+	}
 	marked := r.marked.Load()
 	if !marked {
 		until := time.Until(r.deadline)
@@ -288,7 +409,7 @@ func (r *RunawayChecker) markQuarantine(now *time.Time) {
 	watchType := strings.ToLower(r.setting.Watch.Type.String())
 	ttl := time.Duration(r.setting.Watch.LastingDurationMs) * time.Millisecond
 
-	r.manager.markQuarantine(r.resourceGroupName, r.getConvictIdentifier(), watchType, ttl, r.action, now)
+	r.manager.markQuarantine(r.resourceGroupName, r.getConvictIdentifier(), watchType, ttl, now)
 }
 
 func (r *RunawayChecker) markRunaway(matchType RunawayMatchType, now *time.Time) {

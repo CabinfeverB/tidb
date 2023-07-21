@@ -42,6 +42,7 @@ import (
 	"github.com/pingcap/tidb/disttask/framework/proto"
 	"github.com/pingcap/tidb/disttask/framework/scheduler"
 	"github.com/pingcap/tidb/domain/infosync"
+	rg "github.com/pingcap/tidb/domain/resourcegroup"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
@@ -192,6 +193,8 @@ type DDL interface {
 	AddResourceGroup(ctx sessionctx.Context, stmt *ast.CreateResourceGroupStmt) error
 	AlterResourceGroup(ctx sessionctx.Context, stmt *ast.AlterResourceGroupStmt) error
 	DropResourceGroup(ctx sessionctx.Context, stmt *ast.DropResourceGroupStmt) error
+	AddRunawayWatch(ctx sessionctx.Context, record *rg.QuarantineRecord) error
+	RemoveRunawayWatch(ctx sessionctx.Context, record *rg.QuarantineRecord) error
 	FlashbackCluster(ctx sessionctx.Context, flashbackTS uint64) error
 
 	// CreateSchemaWithInfo creates a database (schema) given its database info.
